@@ -631,6 +631,41 @@ def test_live_dm_runner_retry_never_reexecutes_failed_claim(tmp_path, monkeypatc
     assert dm_file.read_text(encoding="utf-8") == "hello"
 
 
+@pytest.mark.parametrize("status", ["settled", "failed"])
+def test_live_receipt_runner_without_site_packages(tmp_path, status):
+    """The bare delivery wrapper must read an admitted receipt without YAML deps."""
+    from tools import bot_live_delivery as live
+
+    home = tmp_path / "recipient"
+    owner = dict(profile_home=str(home), session_id="bot", lease_id="lease", live_session_id="live")
+    dm_file = tmp_path / "message.txt"
+    dm_file.write_text("fixture message", encoding="utf-8")
+    delivery_id = bot_mode_dm._dm_delivery_id(dm_file)
+    author = {"id": "bot:sender", "name": "Sender", "is_bot": True}
+    intent_file = Path(str(dm_file) + ".live.json")
+    intent_file.write_text(json.dumps(dict(owner=owner, message="fixture message",
+                                         delivery_id=delivery_id, author=author)), encoding="utf-8")
+    live.deliver_to_live_owner(home, owner, "fixture message", delivery_id=delivery_id, author=author)
+    live.claim_pending_delivery(home, owner)
+    outcome = {"reply": "fixture reply"} if status == "settled" else {"error": "fixture failure"}
+    live.complete_delivery(home, delivery_id, status=status, **outcome)
+    receipt = live.read_delivery_result(home, delivery_id)
+
+    proc = subprocess.run(
+        [sys.executable, "-S", str(Path(bot_mode_dm.__file__).resolve()),
+         "--run-delivery", "--author", json.dumps(author), "query-file", str(dm_file),
+         "--profile-home", str(home), str(tmp_path / "must-not-launch-hermes"), "-p", "recipient"],
+        capture_output=True, text=True, timeout=10,
+    )
+
+    assert proc.returncode == (0 if status == "settled" else 1), (proc.stdout, proc.stderr)
+    assert json.loads(proc.stdout) == dict(status=status, delivery_id=delivery_id, **outcome)
+    assert not proc.stderr
+    assert live.read_delivery_result(home, delivery_id) == receipt
+    assert dm_file.exists() == (status != "settled")
+    assert intent_file.exists() == (status != "settled")
+
+
 # ── plaintext tempfile lifecycle ─────────────────────────────────────────────
 
 
