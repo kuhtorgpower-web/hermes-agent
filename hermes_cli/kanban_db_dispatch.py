@@ -2532,19 +2532,18 @@ def _hermes_path_argv(path: str) -> list[str]:
 
 
 def _resolve_hermes_argv() -> list[str]:
-    """Resolve the ``hermes`` invocation as argv for ``Popen``: ``$HERMES_BIN``
-    (path-like -> absolute; bare names keep PATH semantics, never a
-    same-directory file), then the running interpreter's ``sys.executable -m
-    hermes_cli.main`` (exactly this install; also covers shim-less cron,
-    systemd ``User=``, launchd), then ``which("hermes")`` (Windows: safe PATH
-    search, batch shims fall back to the module form) only when ``hermes_cli``
-    is not importable. The module argv must win over PATH: a PATH-first lookup
-    lets an attacker-planted ``hermes`` shadow the running install (#111569).
-    Mirrors ``gateway.run._resolve_hermes_bin``; local because ``hermes_cli``
-    sits below ``gateway`` in the dependency order.
+    """Resolve the ``hermes`` invocation as argv for ``Popen``.
+
+    ``$HERMES_BIN`` remains the explicit override. Otherwise use the launcher
+    command bound to the source tree that owns this imported dispatcher. A
+    managed wrapper injects that tree into its parent process only; reusing
+    ``sys.executable -m hermes_cli.main`` can therefore drop ``hermes_cli`` in
+    the child. ``installation_command`` selects the durable managed launcher,
+    or builds an equivalent isolated bootstrap for externally owned runtimes.
+    This install-bound command must win over PATH so an attacker-planted
+    ``hermes`` cannot shadow the running install (#111569).
     """
-    import importlib.util
-    import shutil
+    from hermes_cli._launchers import installation_command
 
     env_bin = os.environ.get("HERMES_BIN", "").strip()
     if env_bin:
@@ -2555,16 +2554,8 @@ def _resolve_hermes_argv() -> list[str]:
             return _hermes_path_argv(resolved_env_bin)
         return _module_hermes_argv()
 
-    try:
-        if importlib.util.find_spec("hermes_cli") is not None:
-            return _module_hermes_argv()
-    except Exception:
-        pass
-
-    hermes_bin = _safe_which_no_cwd("hermes") if _kb._IS_WINDOWS else shutil.which("hermes")
-    if hermes_bin:
-        return _hermes_path_argv(hermes_bin)
-    return _module_hermes_argv()
+    install_root = Path(__file__).resolve().parents[1]
+    return installation_command(install_root)
 
 
 def _worker_terminal_timeout_env(
