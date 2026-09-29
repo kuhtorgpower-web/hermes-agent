@@ -20,7 +20,17 @@ from tools import bot_mode_dm, bot_mode_probe, bot_relay
 
 
 @pytest.fixture(autouse=True)
-def _fresh_probe_cache():
+def _fresh_probe_cache(monkeypatch):
+    # Delivery runtime resolution reads the source install's PM manifest in
+    # production. Keep unit tests hermetic; the dedicated launcher test below
+    # verifies that boundary explicitly.
+    from hermes_cli import _launchers
+
+    monkeypatch.setattr(
+        _launchers,
+        "installation_command",
+        lambda root, args, *, module: [sys.executable, str(Path(bot_mode_dm.__file__).resolve()), *args],
+    )
     bot_mode_probe._reset_cache_for_tests()
     yield
     bot_mode_probe._reset_cache_for_tests()
@@ -313,6 +323,34 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
     assert '$(and this is not shell)' in content
 
 
+def test_delivery_command_uses_installation_launcher(tmp_path, monkeypatch):
+    """The detached runner must enter Hermes' managed dependency generation."""
+    from hermes_cli import _launchers
+
+    captured = {}
+
+    def fake_installation_command(root, args, *, module):
+        captured.update(root=root, args=list(args), module=module)
+        return ["/managed/hermes", "--run-module", module, *args]
+
+    monkeypatch.setattr(_launchers, "installation_command", fake_installation_command)
+    dm_file = tmp_path / "message.txt"
+    author = {"id": "bot:sender", "name": "sender", "is_bot": True}
+
+    command = bot_mode_dm._delivery_command(
+        ["hermes", "-p", "researcher"], str(dm_file), stdin_file=False,
+        profile_home=tmp_path / "profile", author=author,
+    )
+
+    parts = shlex.split(command)
+    assert parts[:3] == ["/managed/hermes", "--run-module", "tools.bot_mode_dm"]
+    assert captured["root"] == Path(bot_mode_dm.__file__).resolve().parents[1]
+    assert captured["module"] == "tools.bot_mode_dm"
+    assert captured["args"] == [
+        "--run-delivery", "--author", json.dumps(author, separators=(",", ":")),
+        "query-file", str(dm_file), "--profile-home", str((tmp_path / "profile").resolve()),
+        "hermes", "-p", "researcher",
+    ]
 
 
 def test_cli_runner_ack_is_queued_with_the_runner_delivery_id(tmp_path, monkeypatch):
