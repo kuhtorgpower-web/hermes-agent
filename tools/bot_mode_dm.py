@@ -581,12 +581,31 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
         _unlink_dm_file(dm_file)
 
 
+def _delivery_runner_interpreter(argv: list[str]) -> list[str]:
+    """Use the Python pinned by the Hermes console script when one is available.
+
+    Bot-mode turns can start under a lightweight host interpreter. Live-owner
+    admission, however, reads Hermes state/config and needs the managed venv's
+    dependencies. A non-console transport keeps the caller interpreter.
+    """
+    if argv:
+        try:
+            first_line = Path(argv[0]).read_text(encoding="utf-8", errors="replace").splitlines()[0]
+            if first_line.startswith("#!"):
+                interpreter = shlex.split(first_line[2:].strip())
+                if interpreter:
+                    return interpreter
+        except (OSError, IndexError, ValueError):
+            pass
+    return [sys.executable]
+
+
 def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
                       profile_home: Path | None = None, author: Optional[dict] = None) -> str:
     """Build an argv-safe command for the cleanup-owning background runner:
     ``--run-delivery [--author <json>] <mode> <dm_file> [--profile-home <path>] <argv...>``."""
-    runner_argv = [sys.executable, str(Path(__file__).resolve()), "--run-delivery",
-                   "stdin" if stdin_file else "query-file", dm_file]
+    runner_argv = [*_delivery_runner_interpreter(argv), str(Path(__file__).resolve()), "--run-delivery",
+                  "stdin" if stdin_file else "query-file", dm_file]
     if profile_home is not None:
         runner_argv.extend(["--profile-home", str(Path(profile_home).resolve())])
     runner_argv.extend(argv)
@@ -595,8 +614,10 @@ def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
         # paths executable there; backslash paths are parsed as command names (exit 127).
         runner_argv = [part.replace("\\", "/") for part in runner_argv]
     if author:
-        # Inserted after the slash rewrite: JSON escapes are backslashes too.
-        runner_argv[3:3] = ["--author", json.dumps(author, separators=(",", ":"))]
+        # The parser expects author immediately after the runner marker; the
+        # interpreter itself can occupy one or several argv slots.
+        marker = runner_argv.index("--run-delivery")
+        runner_argv[marker + 1:marker + 1] = ["--author", json.dumps(author, separators=(",", ":"))]
     return shlex.join(runner_argv)
 
 
