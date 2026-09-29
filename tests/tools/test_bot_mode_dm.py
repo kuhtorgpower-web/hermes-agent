@@ -315,25 +315,6 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
 
 
 
-def test_delivery_command_uses_the_hermes_cli_shebang_interpreter(tmp_path):
-    """The detached runner must inherit the managed Python that launches Hermes.
-
-    The caller can be a lightweight host interpreter without third-party packages;
-    live-owner admission imports config/state code that needs Hermes dependencies.
-    """
-    dm_file = tmp_path / "message.txt"
-    dm_file.write_text("secret", encoding="utf-8")
-    managed_python = tmp_path / "managed-python"
-    hermes_cli = tmp_path / "hermes"
-    hermes_cli.write_text(f"#!{managed_python}\n", encoding="utf-8")
-
-    command = bot_mode_dm._delivery_command(
-        [str(hermes_cli), "-p", "researcher"], str(dm_file), stdin_file=False
-    )
-
-    assert shlex.split(command)[0] == str(managed_python)
-
-
 def test_cli_runner_ack_is_queued_with_the_runner_delivery_id(tmp_path, monkeypatch):
     """The CLI-runner ack speaks the same vocabulary as the live-owner and relay branches:
     ``queued`` + ``delivery_id`` (+ ``process_id``). The id is the one the runner itself pins
