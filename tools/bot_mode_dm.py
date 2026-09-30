@@ -833,4 +833,6 @@ def _session_title(agent: Any) -> str:
 
 if __name__ == "__main__":  # pragma: no cover - exercised as a background process
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    if sys.argv[1:2] == ["--run-delivery"]:
+        import hermes_bootstrap  # noqa: F401
     raise SystemExit(_delivery_main(sys.argv[1:]))
