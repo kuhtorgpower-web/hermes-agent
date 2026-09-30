@@ -27,6 +27,12 @@ DELIVERY_DIR_NAME = "bot_live_delivery"
 _SEQUENCE_FILE = ".sequence"
 _OWNER_KEYS = ("profile_home", "session_id", "lease_id", "live_session_id")
 _TERMINAL = frozenset({"settled", "failed", "cancelled", "ambiguous"})
+_CLI_CONSUMER_KIND = "cli"
+_CLI_CONSUMER_KIND_KEY = "bot_live_delivery_consumer_kind"
+
+
+class LiveOwnerNotAccepting(RuntimeError):
+    """The pinned CLI owner stopped accepting new mailbox deliveries before admission."""
 
 
 def find_canonical_owner(profile_home: Path | str) -> dict[str, Any] | None:
@@ -51,14 +57,195 @@ def find_canonical_owner(profile_home: Path | str) -> dict[str, Any] | None:
     return None
 
 
-def find_canonical_live_owner(profile_home: Path | str) -> dict[str, Any] | None:
-    """Only advertised consumers may receive owner-pinned mailbox deliveries."""
+def find_canonical_live_owner(
+    profile_home: Path | str, *, include_cli: bool = False,
+) -> dict[str, Any] | None:
+    """Find an advertised owner; CLI owners are opt-in for the local Bot Chat route only."""
     entry = find_canonical_owner(profile_home)
     meta = (entry or {}).get("metadata") or {}
+    if meta.get(_CLI_CONSUMER_KIND_KEY) == _CLI_CONSUMER_KIND and not include_cli:
+        return None
+    # A quiet CLI can compress its canonical session before its caller updates the lease.
+    # Follow that same lease through the compression chain for the short handoff window.
+    if entry is None and include_cli:
+        entry = _current_cli_consumer(profile_home)
+    meta = (entry or {}).get("metadata") or {}
     if entry and meta.get("bot_live_delivery_consumer") is True and meta.get("live_session_id"):
-        return {key: entry[key] for key in ("profile_home", "session_id", "lease_id")} | {
+        result = {key: entry[key] for key in ("profile_home", "session_id", "lease_id")} | {
             "live_session_id": meta["live_session_id"]}
+        kind = meta.get(_CLI_CONSUMER_KIND_KEY)
+        if kind == _CLI_CONSUMER_KIND:
+            result["consumer_kind"] = kind
+        return result
     return None
+
+
+def _canonical_bot_chat_tip(profile_home: Path | str):
+    from hermes_state import SessionDB
+
+    home = Path(profile_home).resolve()
+    if not (home / "state.db").is_file():
+        return None, None
+    db = SessionDB(db_path=home / "state.db", read_only=True)
+    try:
+        row = db.get_session_by_title("Bot Chat")
+        return (db.get_compression_tip(row["id"]) if row else None), db
+    except BaseException:
+        db.close()
+        raise
+
+
+def _current_cli_consumer(profile_home: Path | str, lease_id: str | None = None) -> dict[str, Any] | None:
+    """Find the advertised CLI lease for the canonical Bot Chat tip, including a pending compression transfer."""
+    from hermes_cli.active_sessions import active_session_registry_snapshot
+
+    home = Path(profile_home).resolve()
+    tip, db = _canonical_bot_chat_tip(home)
+    if db is None:
+        return None
+    try:
+        if not tip:
+            return None
+        for entry in active_session_registry_snapshot(registry_home=home):
+            if lease_id is not None and entry.get("lease_id") != lease_id:
+                continue
+            meta = entry.get("metadata") or {}
+            if (meta.get("bot_live_delivery_consumer") is not True
+                    or meta.get(_CLI_CONSUMER_KIND_KEY) != _CLI_CONSUMER_KIND
+                    or not meta.get("live_session_id")):
+                continue
+            if db.get_compression_tip(entry.get("session_id")) == tip:
+                return {**entry, "profile_home": str(home), "session_id": tip,
+                        "live_session_id": meta["live_session_id"]}
+    finally:
+        db.close()
+    return None
+
+
+def _cli_consumer_metadata(metadata: dict[str, Any], live_session_id: str) -> dict[str, Any]:
+    updated = dict(metadata)
+    updated.update(
+        live_session_id=live_session_id,
+        bot_live_delivery_consumer=True,
+        **{_CLI_CONSUMER_KIND_KEY: _CLI_CONSUMER_KIND},
+    )
+    return updated
+
+
+def advertise_cli_consumer(
+    profile_home: Path | str, lease: Any, *, session_id: str, live_session_id: str,
+) -> dict[str, Any] | None:
+    """Advertise the quiet CLI poller only while it owns the canonical Bot Chat lease."""
+    from hermes_cli.active_sessions import active_session_registry_snapshot, transfer_active_session
+
+    home = Path(profile_home).resolve()
+    if (not session_id or not live_session_id or lease is None
+            or getattr(lease, "released", True) or not getattr(lease, "enabled", False)):
+        return None
+    with _locked(home):
+        tip, db = _canonical_bot_chat_tip(home)
+        if db is None:
+            return None
+        try:
+            if tip != str(session_id):
+                return None
+        finally:
+            db.close()
+        entry = next((item for item in active_session_registry_snapshot(registry_home=home)
+                      if item.get("lease_id") == lease.lease_id), None)
+        if entry is None or entry.get("session_id") != str(session_id):
+            return None
+        metadata = _cli_consumer_metadata(entry.get("metadata") or {}, live_session_id)
+        if not transfer_active_session(
+            lease, session_id=str(session_id), metadata=metadata, require_exclusive=True,
+        ):
+            return None
+        return {
+            "profile_home": str(home), "session_id": str(session_id),
+            "lease_id": lease.lease_id, "live_session_id": live_session_id,
+            "consumer_kind": _CLI_CONSUMER_KIND,
+        }
+
+
+def sync_cli_consumer(
+    profile_home: Path | str, lease: Any, *, session_id: str, live_session_id: str,
+) -> bool:
+    """Keep the advertised lease on the canonical compression tip with its stable live id."""
+    from hermes_cli.active_sessions import transfer_active_session
+
+    home = Path(profile_home).resolve()
+    if (not session_id or not live_session_id or lease is None
+            or getattr(lease, "released", True) or not getattr(lease, "enabled", False)):
+        return False
+    with _locked(home):
+        current = _current_cli_consumer(home, lease.lease_id)
+        if (current is None or current["metadata"].get("live_session_id") != live_session_id
+                or current["session_id"] != str(session_id)):
+            return False
+        metadata = _cli_consumer_metadata(current.get("metadata") or {}, live_session_id)
+        return transfer_active_session(
+            lease, session_id=current["session_id"], metadata=metadata, require_exclusive=True,
+        )
+
+
+def close_cli_consumer(profile_home: Path | str, lease: Any, *, live_session_id: str) -> bool:
+    """Withdraw the CLI consumer under the admission lock once no accepted work is pending."""
+    from hermes_cli.active_sessions import transfer_active_session
+
+    home = Path(profile_home).resolve()
+    if not live_session_id or lease is None or getattr(lease, "released", True):
+        return True
+    with _locked(home) as root:
+        current = _current_cli_consumer(home, lease.lease_id)
+        if current is None or current["metadata"].get("live_session_id") != live_session_id:
+            return True
+        pending = any(
+            (record := _scan_read(path)) is not None
+            and record["status"] in _PENDING
+            and _matches(home, record, current)
+            for path in root.glob("*.json")
+        )
+        metadata = dict(current.get("metadata") or {})
+        if pending:
+            return False
+        metadata.pop(_CLI_CONSUMER_KIND_KEY, None)
+        metadata.pop("bot_live_delivery_consumer", None)
+        metadata["live_session_id"] = live_session_id
+        if not transfer_active_session(
+            lease, session_id=current["session_id"], metadata=metadata, require_exclusive=True,
+        ):
+            return False
+        return True
+
+
+def abort_cli_consumer(
+    profile_home: Path | str, lease: Any, *, live_session_id: str, reason: str = "quiet CLI owner stopped",
+) -> bool:
+    """On interruption, cancel only unclaimed tickets and withdraw this one-shot consumer."""
+    from hermes_cli.active_sessions import transfer_active_session
+
+    home = Path(profile_home).resolve()
+    if not live_session_id or lease is None or getattr(lease, "released", True):
+        return True
+    with _locked(home) as root:
+        current = _current_cli_consumer(home, lease.lease_id)
+        if current is None or current.get("live_session_id") != live_session_id:
+            return True
+        for path in root.glob("*.json"):
+            record = _scan_read(path)
+            if record is None or record["status"] != "queued" or not _matches(home, record, current):
+                continue
+            record.update(status="cancelled", reply="", error=reason, reason="cancelled",
+                          completed_at=time.time_ns())
+            _write(path, record)
+        metadata = dict(current.get("metadata") or {})
+        metadata.pop(_CLI_CONSUMER_KIND_KEY, None)
+        metadata.pop("bot_live_delivery_consumer", None)
+        metadata["live_session_id"] = live_session_id
+        # The CLI lease may still be on an older tip when another surface has already
+        # acquired the compression child. Withdraw in place; never move this lease onto
+        # the competing surface's session.
+        return transfer_active_session(lease, session_id=lease.session_id, metadata=metadata)
 
 
 def _owner(home: Path | str, owner: dict[str, Any]) -> dict[str, str]:
@@ -216,6 +403,21 @@ def deliver_to_live_owner(
                     or existing.get("notification_category", "result") != notification_category):
                 raise ValueError("delivery id already belongs to a different payload")
             return existing
+        if owner.get("consumer_kind") == _CLI_CONSUMER_KIND:
+            current = _current_cli_consumer(profile_home, pinned["lease_id"])
+            if (current is None
+                    or current.get("metadata", {}).get("live_session_id") != pinned["live_session_id"]
+                    or current.get("metadata", {}).get(_CLI_CONSUMER_KIND_KEY) != _CLI_CONSUMER_KIND):
+                raise LiveOwnerNotAccepting("the Bot Chat CLI owner is no longer accepting new deliveries")
+            if pinned["session_id"] != current["session_id"]:
+                from hermes_state import SessionDB
+
+                db = SessionDB(db_path=Path(profile_home) / "state.db", read_only=True)
+                try:
+                    if db.get_compression_tip(pinned["session_id"]) != current["session_id"]:
+                        raise LiveOwnerNotAccepting("the pinned Bot Chat CLI owner is no longer canonical")
+                finally:
+                    db.close()
         record = dict(delivery_id=key, id=key, owner=pinned, **pinned,
                       message=message, status="queued", created_at=time.time_ns(),
                       sequence=_next_sequence(root), **({"author": dict(author)} if author else {}))
@@ -223,6 +425,30 @@ def deliver_to_live_owner(
             record["notification_category"] = notification_category
         _write(path, record)
         return record
+
+
+def discard_unadmitted_intent(
+    profile_home: Path | str, delivery_id: str, intent_path: Path | str, expected_intent: dict[str, Any],
+) -> bool:
+    """Remove only the exact intent whose ticket is still provably absent under the mailbox lock."""
+    key = _delivery_id(delivery_id)
+    path = Path(intent_path)
+    with _locked(profile_home) as root:
+        if _read(root / f"{key}.json") is not None:
+            return False
+        try:
+            current = json.loads(path.read_text(encoding="utf-8-sig"))
+        except FileNotFoundError:
+            return True
+        except (OSError, ValueError):
+            return False
+        if current != expected_intent:
+            return False
+        path.unlink()
+        from utils import fsync_directory
+
+        fsync_directory(path.parent)
+        return True
 
 
 def _matches(home: Path | str, record: dict, owner: dict) -> bool:

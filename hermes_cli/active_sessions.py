@@ -594,9 +594,15 @@ def release_active_session(lease: ActiveSessionLease) -> None:
 
 
 def transfer_active_session(
-    lease: ActiveSessionLease, *, session_id: str, metadata: Optional[dict[str, Any]] = None
+    lease: ActiveSessionLease, *, session_id: str, metadata: Optional[dict[str, Any]] = None,
+    require_exclusive: bool = False,
 ) -> bool:
-    """Move an existing lease to a new session id without dropping the slot."""
+    """Move an existing lease without dropping the slot.
+
+    require_exclusive atomically refuses a target session already held by
+    another lease. Most compression transfers preserve the existing re-anchor
+    behavior; consumers that must not share a tip can opt into the fence.
+    """
     new_session_id = str(session_id or "")
     if not new_session_id or lease.released:
         return False
@@ -619,6 +625,12 @@ def transfer_active_session(
         if loaded is None:
             return False
         entries = loaded[1]
+        if require_exclusive and any(
+            str(entry.get("lease_id") or "") != lease.lease_id
+            and str(entry.get("session_id") or "") == new_session_id
+            for entry in entries
+        ):
+            return False
         own = next((e for e in entries if str(e.get("lease_id") or "") == lease.lease_id), None)
         if own is not None:
             own["session_id"] = new_session_id

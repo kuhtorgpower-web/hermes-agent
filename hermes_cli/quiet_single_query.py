@@ -21,6 +21,8 @@ from typing import Any, Callable, MutableMapping
 
 # Nested A→B→C is one extra turn; this caps a runaway message_agent chain.
 _MAX_QUIET_NOTIFY_ROUNDS = 8
+QUIET_BOT_DELIVERY_POLL_SECONDS = 0.5
+QUIET_BOT_DELIVERY_INTERRUPTED = object()
 
 # Last line a Kanban worker leaves in its own log: ``[kanban-worker-exit] rc=<code>``. A per-tick
 # ``hermes kanban dispatch`` process never reaped the worker, so ``os.waitpid`` cannot tell it how
@@ -189,6 +191,133 @@ def quiet_notify_linger_seconds() -> float:
     return ProcessRegistry._oneshot_completion_wait_seconds()
 
 
+def start_quiet_cli_live_delivery(cli: Any, *, turn_author_supported: bool) -> bool:
+    """Advertise only this quiet CLI poller when it owns the profile's canonical Bot Chat."""
+    lease = getattr(cli, "_active_session_lease", None)
+    session_id = str(getattr(cli, "session_id", "") or "")
+    agent_db = getattr(getattr(cli, "agent", None), "_session_db", None)
+    db_path = getattr(agent_db, "db_path", None) or getattr(getattr(cli, "_session_db", None), "db_path", None)
+    if not turn_author_supported or lease is None or not session_id or not db_path:
+        return False
+    from pathlib import Path
+    from tools.bot_live_delivery import advertise_cli_consumer
+
+    home = Path(db_path).resolve().parent
+    live_session_id = str(getattr(cli, "_quiet_bot_live_session_id", "") or session_id)
+    owner = advertise_cli_consumer(home, lease, session_id=session_id, live_session_id=live_session_id)
+    if owner is None:
+        return False
+    cli._quiet_bot_live_delivery = {"home": home, "live_session_id": live_session_id}
+    cli._quiet_bot_live_session_id = live_session_id
+    cli._quiet_bot_live_delivery_lost = False
+    return True
+
+
+def sync_quiet_cli_live_delivery(cli: Any) -> bool:
+    state = getattr(cli, "_quiet_bot_live_delivery", None)
+    if not state:
+        return False
+    from tools.bot_live_delivery import sync_cli_consumer
+
+    synced = sync_cli_consumer(
+        state["home"], getattr(cli, "_active_session_lease", None),
+        session_id=str(getattr(cli, "session_id", "") or ""),
+        live_session_id=state["live_session_id"],
+    )
+    if not synced:
+        cli._quiet_bot_live_delivery_lost = True
+        abort_quiet_cli_live_delivery(cli, reason="CLI no longer owns the canonical Bot Chat tip")
+    return synced
+
+
+def poll_quiet_cli_live_delivery_once(cli: Any, history: list, *, turn_author_supported: bool = True):
+    """Run one claimed mailbox turn at an idle boundary and return its updated shared history."""
+    state = getattr(cli, "_quiet_bot_live_delivery", None)
+    if not state:
+        return None
+    from tools.bot_live_delivery import (
+        claim_pending_delivery, complete_delivery, find_canonical_live_owner,
+    )
+
+    if (getattr(cli, "_quiet_bot_live_delivery_lost", False)
+            or not sync_quiet_cli_live_delivery(cli)):
+        return None
+    home = state["home"]
+    owner = find_canonical_live_owner(home, include_cli=True)
+    lease = getattr(cli, "_active_session_lease", None)
+    if (owner is None or lease is None or owner.get("lease_id") != lease.lease_id
+            or owner.get("live_session_id") != state["live_session_id"]):
+        return None
+    claimed = claim_pending_delivery(home, owner)
+    if claimed is None:
+        return None
+
+    delivery_id = str(claimed["delivery_id"])
+    author = claimed.get("author") or None
+    kwargs = {}
+    if author and turn_author_supported:
+        kwargs["turn_author"] = author
+    try:
+        result = cli.agent.run_conversation(
+            user_message=claimed["message"], conversation_history=history, **kwargs,
+        )
+    except KeyboardInterrupt:
+        complete_delivery(home, delivery_id, status="cancelled", error="interrupted", reason="cancelled")
+        raise
+    except Exception as exc:
+        error = str(exc)
+        from tools.bot_failure_reasons import classify_agent_error
+
+        complete_delivery(home, delivery_id, status="failed", error=error,
+                          reason=classify_agent_error(error))
+        return history
+
+    updated_history = result.get("messages") if isinstance(result, dict) else None
+    if isinstance(updated_history, list) and updated_history:
+        history = updated_history
+        cli.conversation_history = history
+    if isinstance(result, dict) and result.get("interrupted"):
+        complete_delivery(home, delivery_id, status="cancelled", error="interrupted", reason="cancelled")
+        from cli import _sync_cli_session_id_from_agent
+
+        _sync_cli_session_id_from_agent(cli)
+        abort_quiet_cli_live_delivery(cli, reason="mailbox turn interrupted")
+        return QUIET_BOT_DELIVERY_INTERRUPTED
+    failed = (not isinstance(result, dict) or result.get("failed") or result.get("partial")
+              or result.get("completed") is False)
+    if failed:
+        error = str(result.get("error") or "mailbox turn did not complete") if isinstance(result, dict) else "mailbox turn did not run"
+        from tools.bot_failure_reasons import classify_agent_error
+
+        complete_delivery(home, delivery_id, status="failed", error=error,
+                          reason=classify_agent_error(error))
+    else:
+        reply = str(result.get("final_response") or "")
+        from gateway.response_filters import is_intentional_silence_response
+
+        if is_intentional_silence_response(reply):
+            reply = ""
+        complete_delivery(home, delivery_id, status="settled", reply=reply)
+    from cli import _sync_cli_session_id_from_agent
+
+    _sync_cli_session_id_from_agent(cli)
+    return history
+
+
+def abort_quiet_cli_live_delivery(cli: Any, *, reason: str) -> None:
+    """Withdraw an interrupted one-shot consumer without starting another model turn."""
+    state = getattr(cli, "_quiet_bot_live_delivery", None)
+    if not state:
+        return
+    from tools.bot_live_delivery import abort_cli_consumer
+
+    abort_cli_consumer(
+        state["home"], getattr(cli, "_active_session_lease", None),
+        live_session_id=state["live_session_id"], reason=reason,
+    )
+    cli._quiet_bot_live_delivery = None
+
+
 def continue_quiet_notify_completions(
     session_id: str,
     run_turn: Callable[[str], Any],
@@ -196,6 +325,9 @@ def continue_quiet_notify_completions(
     owns_event=None,
     max_rounds: int = _MAX_QUIET_NOTIFY_ROUNDS,
     linger_budget: float | None = None,
+    on_idle: Callable[[], Any] | None = None,
+    on_finish: Callable[[bool], Any] | None = None,
+    idle_poll_seconds: float = QUIET_BOT_DELIVERY_POLL_SECONDS,
 ) -> Any:
     """Linger for ``notify_on_complete`` work, then run owned completion texts as follow-up turns.
 
@@ -209,12 +341,40 @@ def continue_quiet_notify_completions(
     from tools.async_delegation import claim_event_delivery, complete_event_delivery
 
     last: Any = None
+    finish_called = False
     key = session_id or ""
     if linger_budget is None:
         linger_budget = quiet_notify_linger_seconds()
     deadline = time.monotonic() + max(float(linger_budget), 0.0)
-    for _ in range(max_rounds):
-        wait = process_registry.wait_for_pending_completions(None, timeout=max(deadline - time.monotonic(), 0.0))
+    for round_index in range(max_rounds):
+        while True:
+            remaining = max(deadline - time.monotonic(), 0.0)
+            if remaining <= 0:
+                wait = (process_registry.wait_for_pending_completions(None, timeout=0.0)
+                        if on_idle is None else {"timed_out": True})
+                break
+            wait_budget = min(remaining, max(float(idle_poll_seconds), 0.01)) if on_idle else remaining
+            wait = process_registry.wait_for_pending_completions(None, timeout=wait_budget)
+            idle_result = on_idle() if on_idle is not None else None
+            if idle_result is QUIET_BOT_DELIVERY_INTERRUPTED:
+                wait = {"interrupted": True}
+                break
+            if idle_result is True:
+                # A mailbox turn may have started notify_on_complete work. Re-enter the
+                # same wait loop before draining follow-ups or attempting the final close.
+                continue
+            if wait.get("interrupted"):
+                break
+            # A short poll timeout is only a chance to check the mailbox; preserve the
+            # original absolute linger deadline and the existing notify round budget.
+            if not (on_idle is not None and wait.get("timed_out")
+                    and time.monotonic() < deadline):
+                break
+        if wait.get("interrupted"):
+            if on_finish is not None:
+                on_finish(False)
+                finish_called = True
+            break
         drained = []
         for event, text in process_registry.drain_notifications(session_key=key, owns_event=owns_event):
             # Durable async_delegation events carry a delivery ledger: without the
@@ -239,9 +399,18 @@ def continue_quiet_notify_completions(
             if not _diagnostic_only_wake_muted([event for event, text in drained if text]):
                 last = follow
         if wait.get("timed_out"):
+            if on_finish is not None:
+                on_finish(False)
+                finish_called = True
             break
         if not texts:
+            can_continue = round_index + 1 < max_rounds and time.monotonic() < deadline
+            if on_finish is not None and on_finish(can_continue) is True:
+                continue
+            finish_called = on_finish is not None
             return last
+    if on_finish is not None and not finish_called:
+        on_finish(False)
     return last
 
 

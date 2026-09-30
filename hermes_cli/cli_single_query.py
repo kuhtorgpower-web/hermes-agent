@@ -120,6 +120,12 @@ def _sync_cli_session_id_from_agent(cli) -> None:
     """Keep ``cli.session_id`` in sync when mid-run compression rotated the agent's session."""
     if getattr(cli.agent, "session_id", None) and cli.agent.session_id != cli.session_id:
         cli.session_id = cli.agent.session_id
+    # The quiet Bot Chat mailbox lease follows this compression tip while retaining
+    # its original live-session identity for already queued receipts.
+    if getattr(cli, "_quiet_bot_live_delivery", None):
+        from hermes_cli.quiet_single_query import sync_quiet_cli_live_delivery
+
+        sync_quiet_cli_live_delivery(cli)
 
 
 # ``failure_reason`` values that say nothing about the task itself: the provider is walled,
@@ -188,8 +194,11 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     from agent.interrupt_compat import _accepts_keyword
     from agent.turn_author import take_turn_author_from_env
     from hermes_cli.quiet_single_query import (
-        adopt_unanswered_turn, bind_quiet_session_key, continue_quiet_notify_completions,
-        exit_single_query, quiet_notify_linger_seconds, take_turn_report_path, write_turn_report,
+        abort_quiet_cli_live_delivery, adopt_unanswered_turn, bind_quiet_session_key,
+        continue_quiet_notify_completions,
+        exit_single_query, poll_quiet_cli_live_delivery_once,
+        quiet_notify_linger_seconds, start_quiet_cli_live_delivery, take_turn_report_path,
+        write_turn_report, QUIET_BOT_DELIVERY_INTERRUPTED,
     )
 
     author = take_turn_author_from_env()
@@ -199,17 +208,27 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     # A dispatcher's re-run of a failed bot delivery resumes the DM row its first attempt persisted.
     adopt_unanswered_turn(cli, effective_query)
     author_kwargs = {"turn_author": author} if author is not None and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}
+    turn_author_supported = _accepts_keyword(cli.agent.run_conversation, "turn_author")
+    live_delivery_consumer = start_quiet_cli_live_delivery(
+        cli, turn_author_supported=turn_author_supported,
+    )
     with bind_quiet_session_key(getattr(cli, "session_id", "") or "default"):
         try:
             result = cli.agent.run_conversation(
                 user_message=effective_query, conversation_history=cli.conversation_history, **author_kwargs,
             )
         except KeyboardInterrupt:
+            if live_delivery_consumer:
+                abort_quiet_cli_live_delivery(cli, reason="interrupted")
             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
             if emitter is not None:
                 exit_single_query(emitter.emit_result({"failed": True, "error": "Interrupted"}, session_id=cli.session_id or "", exit_code=130))
             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
             exit_single_query(130)
+        except BaseException:
+            if live_delivery_consumer:
+                abort_quiet_cli_live_delivery(cli, reason="quiet CLI owner stopped unexpectedly")
+            raise
         # The exit line below reports session_id to stderr for automation wrappers;
         # without this sync it would point at the ended parent after compression.
         _sync_cli_session_id_from_agent(cli)
@@ -225,11 +244,35 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
             )
 
         _report_turn(result)
-        if isinstance(result, dict) and not result.get("failed"):
-            history = result.get("messages") or cli.conversation_history
+        history = (result.get("messages") or cli.conversation_history
+                   if isinstance(result, dict) else cli.conversation_history)
+        mailbox_interrupted = isinstance(result, dict) and bool(result.get("interrupted"))
+        if mailbox_interrupted and live_delivery_consumer:
+            abort_quiet_cli_live_delivery(cli, reason="original quiet turn interrupted")
+            live_delivery_consumer = False
+        elif live_delivery_consumer and (not isinstance(result, dict) or result.get("failed")):
+            abort_quiet_cli_live_delivery(cli, reason="original quiet turn did not complete")
+            live_delivery_consumer = False
+        if isinstance(result, dict) and not result.get("failed") and not mailbox_interrupted:
+            if live_delivery_consumer:
+                try:
+                    updated = poll_quiet_cli_live_delivery_once(
+                        cli, history, turn_author_supported=turn_author_supported,
+                    )
+                except KeyboardInterrupt:
+                    abort_quiet_cli_live_delivery(cli, reason="mailbox turn interrupted")
+                    mailbox_interrupted = True
+                    updated = None
+                if updated is QUIET_BOT_DELIVERY_INTERRUPTED:
+                    mailbox_interrupted = True
+                elif updated is not None:
+                    history = updated
 
             def _follow_up(text):
-                nonlocal history
+                nonlocal history, mailbox_interrupted
+                if getattr(cli, "_quiet_bot_live_delivery_lost", False):
+                    mailbox_interrupted = True
+                    return {"interrupted": True, "final_response": ""}
                 follow = cli.agent.run_conversation(
                     user_message=text, conversation_history=history, **author_kwargs,
                 )
@@ -238,7 +281,51 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
                 # Same sync contract as the main turn: a compression rotation during a
                 # follow-up must not leave a stale id on the exit line / drain key.
                 _sync_cli_session_id_from_agent(cli)
+                if isinstance(follow, dict) and follow.get("interrupted"):
+                    mailbox_interrupted = True
+                    if live_delivery_consumer:
+                        abort_quiet_cli_live_delivery(cli, reason="quiet notify follow-up interrupted")
                 return follow
+
+            def _poll_live_delivery():
+                nonlocal history, mailbox_interrupted
+                if (mailbox_interrupted
+                        or getattr(cli, "_quiet_bot_live_delivery_lost", False)):
+                    return QUIET_BOT_DELIVERY_INTERRUPTED
+                updated = poll_quiet_cli_live_delivery_once(
+                    cli, history, turn_author_supported=turn_author_supported,
+                )
+                if updated is QUIET_BOT_DELIVERY_INTERRUPTED:
+                    mailbox_interrupted = True
+                    return QUIET_BOT_DELIVERY_INTERRUPTED
+                if updated is not None:
+                    history = updated
+                    return True
+                return False
+
+            def _finish_live_delivery(can_continue):
+                if not getattr(cli, "_quiet_bot_live_delivery", None):
+                    return False
+                from tools.bot_live_delivery import close_cli_consumer
+
+                state = cli._quiet_bot_live_delivery
+                from hermes_cli.quiet_single_query import sync_quiet_cli_live_delivery
+
+                if not sync_quiet_cli_live_delivery(cli):
+                    return False
+                if close_cli_consumer(
+                    state["home"], cli._active_session_lease,
+                    live_session_id=state["live_session_id"],
+                ):
+                    cli._quiet_bot_live_delivery = None
+                    return False
+                if can_continue:
+                    return _poll_live_delivery() is True
+                abort_quiet_cli_live_delivery(
+                    cli, reason="quiet CLI linger ended before delivery could run",
+                )
+                return False
+                return False
 
             # One shared linger budget for the whole run: the loop below and the later
             # _wait_for_oneshot_background_completions pass must not each wait the full
@@ -246,19 +333,31 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
             # Flagged after the loop (finally-equivalent): the wait is the loop's first
             # statement, so anything raising past that point has consumed budget the
             # finalize pass must not re-wait.
-            try:
-                continued = continue_quiet_notify_completions(
-                    getattr(cli, "session_id", "") or "",
-                    _follow_up,
-                    owns_event=getattr(cli, "_owns_process_notification", None),
-                    linger_budget=quiet_notify_linger_seconds(),
-                )
-            finally:
-                cli._quiet_notify_linger_done = True
-            if isinstance(continued, dict):
-                result = continued
-                # A teammate's reply displaced the answer this run prints; tell the spawner.
-                _report_turn(result)
+            if not mailbox_interrupted:
+                try:
+                    continued = continue_quiet_notify_completions(
+                        getattr(cli, "session_id", "") or "",
+                        _follow_up,
+                        owns_event=getattr(cli, "_owns_process_notification", None),
+                        linger_budget=quiet_notify_linger_seconds(),
+                        on_idle=_poll_live_delivery if live_delivery_consumer else None,
+                        on_finish=_finish_live_delivery if live_delivery_consumer else None,
+                    )
+                except KeyboardInterrupt:
+                    if live_delivery_consumer:
+                        abort_quiet_cli_live_delivery(cli, reason="mailbox turn interrupted")
+                    mailbox_interrupted = True
+                    continued = None
+                except BaseException:
+                    if live_delivery_consumer:
+                        abort_quiet_cli_live_delivery(cli, reason="quiet CLI owner stopped unexpectedly")
+                    raise
+                finally:
+                    cli._quiet_notify_linger_done = True
+                if isinstance(continued, dict):
+                    result = continued
+                    # A teammate's reply displaced the answer this run prints; tell the spawner.
+                    _report_turn(result)
         response = result.get("final_response", "") if isinstance(result, dict) else str(result)
     # Surface backend errors that produced no visible output (e.g. invalid model slug
     # -> provider 4xx) on stderr so piped stdout stays clean.
@@ -283,7 +382,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     if emitter is None:
         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
 
-    _exit_code = _single_query_exit_code(result)
+    _exit_code = 130 if mailbox_interrupted else _single_query_exit_code(result)
     if emitter is not None:
         _exit_code = emitter.emit_result(result, session_id=cli.session_id or "", exit_code=_exit_code)
     exit_single_query(_exit_code)

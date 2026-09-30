@@ -477,7 +477,10 @@ def _dm_delivery_id(dm_file: "str | os.PathLike") -> str:
 
 def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dict] = None) -> dict | None:
     """Pin intent before admission; retries may inspect, never change transport."""
-    from tools.bot_live_delivery import deliver_to_live_owner, find_canonical_live_owner, read_delivery_result
+    from tools.bot_live_delivery import (
+        LiveOwnerNotAccepting, deliver_to_live_owner, discard_unadmitted_intent,
+        find_canonical_live_owner, read_delivery_result,
+    )
     from utils import fsync_directory
 
     intent: dict[str, Any]
@@ -487,6 +490,8 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
     else:
         assert profile_home is not None
         owner = find_canonical_live_owner(profile_home)
+        if owner is None:
+            owner = find_canonical_live_owner(profile_home, include_cli=True)
         if owner is None:
             return None
         intent = dict(owner=owner, message=Path(dm_file).read_text(encoding="utf-8-sig"),
@@ -505,8 +510,23 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
     home = intent["owner"]["profile_home"]
     record = read_delivery_result(home, intent["delivery_id"])
     if record is None:
-        record = deliver_to_live_owner(home, intent["owner"], intent["message"],
-                                       delivery_id=intent["delivery_id"], author=intent.get("author"))
+        try:
+            record = deliver_to_live_owner(home, intent["owner"], intent["message"],
+                                           delivery_id=intent["delivery_id"], author=intent.get("author"))
+        except LiveOwnerNotAccepting:
+            if not discard_unadmitted_intent(home, intent["delivery_id"], intent_path, intent):
+                # A concurrent retry may have admitted this exact id after the rejection check.
+                # Reuse only its exact receipt; otherwise retain the evidence as ambiguous.
+                record = read_delivery_result(home, intent["delivery_id"])
+                if record is None:
+                    raise RuntimeError("could not prove the stale live-owner intent was never admitted")
+                pinned_owner = {key: intent["owner"].get(key) for key in (
+                    "profile_home", "session_id", "lease_id", "live_session_id")}
+                if (record.get("owner") != pinned_owner or record.get("message") != intent["message"]
+                        or record.get("author") != intent.get("author")):
+                    raise ValueError("delivery id already belongs to a different payload")
+            else:
+                return None
     return record
 
 
@@ -565,6 +585,7 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
                 return 1
             if record is not None:
                 return _wait_live_dm(record["profile_home"], record["delivery_id"], dm_file=dm_file)
+    retain_payload = False
     try:
         from tools.bot_relay import delivery_env
 
@@ -577,8 +598,34 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
             with open(dm_file, "r", encoding="utf-8-sig") as stream:
                 # Passing the file descriptor as stdin bypasses the BOM-aware decoder.
                 return subprocess.run(argv, input=stream.read().encode("utf-8"), check=False, env=env).returncode
+    except Exception as exc:
+        from tools.bot_relay import TurnBusyError
+
+        if stdin_file or not isinstance(exc, TurnBusyError):
+            raise
+        # The only safe retry point is a lock refusal: no child turn ran, so the same
+        # payload and delivery id can still be handed to the live owner exactly once.
+        home = profile_home or _local_delivery_home(argv)
+        if home is None:
+            raise
+        try:
+            record = _admit_live_dm(home, dm_file, author)
+        except Exception as admission_exc:
+            retain_payload = True
+            print(json.dumps({
+                "status": "ambiguous",
+                "delivery_id": _dm_delivery_id(dm_file),
+                "error": f"Live admission outcome unknown after queue wait: {admission_exc}. Do not resend.",
+                "evidence_file": dm_file,
+            }))
+            return 1
+        if record is None:
+            raise
+        retain_payload = True
+        return _wait_live_dm(record["profile_home"], record["delivery_id"], dm_file=dm_file)
     finally:
-        _unlink_dm_file(dm_file)
+        if not retain_payload:
+            _unlink_dm_file(dm_file)
 
 
 def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
