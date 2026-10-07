@@ -98,7 +98,7 @@ def _parked_profile(root: Path, target: str) -> tuple[str, Path] | None:
     Parked profiles are intentionally absent from the teammate roster, but a direct
     request for one must be refused locally rather than mistaken for a remote target.
     """
-    from hermes_constants import PROFILE_ID_RE, named_profile_is_live
+    from hermes_constants import PROFILE_ID_RE, named_profile_is_deleted, named_profile_is_live
     from hermes_cli.profiles import profile_is_parked
 
     want = str(target or "").strip().lstrip("@").lower()
@@ -115,6 +115,13 @@ def _parked_profile(root: Path, target: str) -> tuple[str, Path] | None:
     exact = next((c for c in candidates if c.name.lower() == want), None)
     if exact is not None:
         return exact.name, exact
+    # A physically archived profile may leave only the tombstone and a
+    # gateway.parked stub. That exact id remains a known local blocked target;
+    # do not inspect aliases because the archived identity is no longer present.
+    if PROFILE_ID_RE.match(want):
+        archived_stub = profiles / want
+        if named_profile_is_deleted(archived_stub):
+            return want, archived_stub
     hits = []
     for candidate in candidates:
         if any(wanted_forms & alias_forms(name) for name in _friendly_names(candidate) if name):

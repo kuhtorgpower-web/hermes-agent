@@ -576,9 +576,14 @@ def _local_delivery_home(argv: list[str]) -> Path | None:
     if target == "default":
         return root
     candidate = root / "profiles" / target
-    from hermes_constants import PROFILE_ID_RE, named_profile_is_live
+    from hermes_constants import PROFILE_ID_RE, named_profile_is_deleted, named_profile_is_live
 
     if PROFILE_ID_RE.match(target) and named_profile_is_live(candidate):
+        return candidate
+    if PROFILE_ID_RE.match(target) and named_profile_is_deleted(candidate):
+        # Preserve the final runner's parked check for an identity-free stub
+        # left by profile archival. The CLI will reject the tombstone too, but
+        # delivery must stop before queue admission or process launch.
         return candidate
     return dict(_roster(root)).get(target)
 
