@@ -221,6 +221,81 @@ def test_parked_local_target_is_omitted_and_refused_before_any_delivery(tmp_path
     assert "parked" in start_result["error"]
 
 
+def test_archived_tombstoned_stub_is_omitted_and_refused_before_delivery(tmp_path, monkeypatch):
+    from hermes_constants import mark_named_profile_deleted
+
+    home = _managed_home(tmp_path, teammates=("coder",))
+    archived_stub = home / "profiles" / "researcher"
+    archived_stub.mkdir()
+    (archived_stub / "gateway.parked").touch()
+    mark_named_profile_deleted(archived_stub)
+    agent = _FakeAgent(home)
+
+    roster = bot_mode_probe.get_bot_mode_protocol_section(home)
+    assert "researcher" not in roster
+    assert "coder" in roster
+    monkeypatch.setattr(bot_mode_dm, "_write_dm_file", lambda *_: pytest.fail("must not write DM payload"))
+    monkeypatch.setattr(bot_mode_dm, "_try_relay_delivery", lambda *a, **k: pytest.fail("must not use remote fallback"))
+    monkeypatch.setattr(bot_mode_dm, "_spawn_delivery", lambda *a, **k: pytest.fail("must not spawn delivery"))
+
+    result = json.loads(bot_mode_dm.message_agent_tool(target="researcher", message="hi", agent=agent))
+    assert "parked" in result["error"]
+
+
+def test_archived_tombstone_restore_returns_to_parked_then_active_behavior(tmp_path, monkeypatch):
+    from hermes_constants import clear_named_profile_deleted, mark_named_profile_deleted
+
+    home = _managed_home(tmp_path, teammates=("coder",))
+    profile = home / "profiles" / "researcher"
+    profile.mkdir()
+    archived = home / "protected-backup" / "profiles" / "researcher"
+    archived.parent.mkdir(parents=True)
+    (profile / "profile.yaml").write_text("ui_meta:\n  hermes-bots:\n    shape: cloud\n", encoding="utf-8")
+    (profile / "gateway.parked").touch()
+    mark_named_profile_deleted(profile)
+    profile.rename(archived)
+    profile.mkdir()
+    (profile / "gateway.parked").touch()
+
+    # Move the saved profile back and clear its tombstone. The gateway marker
+    # keeps it in the ordinary parked state until explicitly resumed.
+    profile.joinpath("gateway.parked").unlink()
+    profile.rmdir()
+    archived.rename(profile)
+    clear_named_profile_deleted(profile)
+
+    assert "researcher" not in bot_mode_probe.get_bot_mode_protocol_section(home)
+    parked = json.loads(bot_mode_dm.message_agent_tool("researcher", "hi", agent=_FakeAgent(home)))
+    assert "parked" in parked["error"]
+
+    profile.joinpath("gateway.parked").unlink()
+    starts = []
+    monkeypatch.setattr(bot_mode_dm, "_start_delivery", lambda *a, **k: starts.append(a) or json.dumps({"status": "started"}))
+    active = json.loads(bot_mode_dm.message_agent_tool("researcher", "hi", agent=_FakeAgent(home)))
+    assert active["status"] == "started"
+    assert starts
+
+
+def test_archived_tombstoned_stub_is_known_to_delivery_runner_from_argv(tmp_path, monkeypatch, capsys):
+    from hermes_constants import mark_named_profile_deleted
+
+    home = _managed_home(tmp_path, teammates=("coder",))
+    stub = home / "profiles" / "researcher"
+    stub.mkdir()
+    (stub / "gateway.parked").touch()
+    mark_named_profile_deleted(stub)
+    dm_file = tmp_path / "prepared-message.txt"
+    dm_file.write_text("already prepared", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(bot_mode_dm, "_admit_live_dm", lambda *a, **k: pytest.fail("must not admit archived target"))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("must not launch CLI"))
+
+    assert bot_mode_dm._run_delivery(["hermes", "-p", "researcher"], str(dm_file), stdin_file=False) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert "parked" in result["error"]
+    assert dm_file.read_text(encoding="utf-8") == "already prepared"
+
+
 def test_qualified_remote_target_is_resolved_before_local_parked_alias(tmp_path, monkeypatch):
     home = _managed_home(tmp_path, teammates=("onboarder",))
     (home / "profiles" / "onboarder" / "gateway.parked").touch()
@@ -231,6 +306,28 @@ def test_qualified_remote_target_is_resolved_before_local_parked_alias(tmp_path,
         return json.dumps({"status": "queued", "to": target})
 
     monkeypatch.setattr(bot_mode_dm, "_try_relay_delivery", resolve_remote)
+    result = json.loads(bot_mode_dm.message_agent_tool(
+        target="onboarder@other-connection", message="hi", agent=_FakeAgent(home)
+    ))
+    assert result == {"status": "queued", "to": "onboarder@other-connection"}
+    assert calls == ["onboarder@other-connection"]
+
+
+def test_qualified_remote_target_is_not_captured_by_archived_local_tombstone(tmp_path, monkeypatch):
+    from hermes_constants import mark_named_profile_deleted
+
+    home = _managed_home(tmp_path, teammates=("coder",))
+    stub = home / "profiles" / "onboarder"
+    stub.mkdir()
+    (stub / "gateway.parked").touch()
+    mark_named_profile_deleted(stub)
+    calls = []
+    monkeypatch.setattr(
+        bot_mode_dm, "_try_relay_delivery",
+        lambda root, target, content, sender, **kwargs: calls.append(target)
+        or json.dumps({"status": "queued", "to": target}),
+    )
+
     result = json.loads(bot_mode_dm.message_agent_tool(
         target="onboarder@other-connection", message="hi", agent=_FakeAgent(home)
     ))
