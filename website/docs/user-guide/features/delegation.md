@@ -578,6 +578,31 @@ For **durable execution** that must survive session closure or process restart, 
 - Only the final summary enters the parent's context, keeping token usage efficient
 - Subagents inherit the parent's **API key, provider configuration, and credential pool** (enabling key rotation on rate limits)
 
+## Profile-owned child tool cap
+
+Set `delegation.child_toolsets` in the served profile's `config.yaml` to bound native
+delegated children independently of the parent's own operations:
+
+```yaml
+delegation:
+  child_toolsets: [web, vision]
+```
+
+The cap applies to inherited toolsets and internal explicit requests. Composite
+parent bundles such as `hermes-cli` are expanded before intersection: this example
+allows only `web` and `vision` that the parent already holds. Parent disables and
+mandatory child denies still apply. The parent's tool list is unchanged.
+MCP inheritance cannot append toolsets outside the cap, and an orchestrator does
+not regain delegation unless the cap and parent selection permit it.
+
+Omitting this key preserves existing behavior. An explicit `[]` gives children no
+tools; it never falls back to the default toolsets or all tools. A non-list value,
+non-string entry, or unknown toolset name rejects child construction with a
+`delegation.child_toolsets` configuration error. This is a trusted backend setting,
+not a model-facing per-call choice. Tool availability checks may further reduce
+the allowed surface. `message_agent` is separately injected only for a managed
+canonical Bot Chat; native children's subagent sessions do not pass that gate.
+
 ## Worktree Isolation
 
 By default, subagents share the parent's working directory — fine for research

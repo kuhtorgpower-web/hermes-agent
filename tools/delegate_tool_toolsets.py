@@ -5,8 +5,8 @@ from __future__ import annotations
 import logging
 from typing import List, Optional
 
-from toolsets import TOOLSETS, resolve_toolset
-from tools.delegate_tool_config import _get_inherit_mcp_toolsets
+from toolsets import TOOLSETS, resolve_toolset, validate_toolset
+from tools.delegate_tool_config import _cfg, _get_inherit_mcp_toolsets
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
 
@@ -81,8 +81,15 @@ def _resolve_child_toolsets(
     ``toolsets`` are intersected with the parent's (composite-expanded) set, else the parent's enabled set is
     inherited. Blocked tools are stripped twice — whole blocked toolsets here, and exact one-tool deny toolsets via
     ``disabled_toolsets`` so blocked names inside mixed bundles (hermes-cli) are subtracted AFTER composite
-    expansion and survive registry refreshes. Orchestrators get ``delegation`` re-added unconditionally
-    (role-granted, not inherited)."""
+    expansion and survive registry refreshes. A profile's optional ``delegation.child_toolsets`` caps both
+    inherited and explicit selections, including MCP inheritance and orchestrator role grants."""
+    cfg = _cfg()
+    cap = cfg.get("child_toolsets")
+    if "child_toolsets" in cfg and (
+        not isinstance(cap, list)
+        or any(not isinstance(name, str) or not validate_toolset(name) for name in cap)
+    ):
+        raise ValueError("delegation.child_toolsets must be a list of known toolset names (use [] for no tools)")
     # enabled_toolsets=None means "all tools", so derive from loaded tool names.
     parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
     if parent_enabled is not None:
@@ -107,17 +114,33 @@ def _resolve_child_toolsets(
         child_toolsets = parent_enabled
     else:
         child_toolsets = sorted(parent_toolsets) or DEFAULT_TOOLSETS
+
+    if cap is not None:
+        # Select from the trusted cap, rather than keeping a broad inherited composite.
+        # Expand explicit composite requests as well, so requesting hermes-cli cannot bypass
+        # the cap or accidentally discard its allowed web/vision subsets.
+        allowed_parent = _expand_parent_toolsets(parent_toolsets)
+        allowed_request = _expand_parent_toolsets(set(toolsets)) if toolsets else allowed_parent
+        child_toolsets = list(dict.fromkeys(
+            name for name in cap if name in allowed_parent and name in allowed_request
+        ))
+    can_delegate = effective_role == "orchestrator" and (
+        cap is None or "delegation" in _expand_parent_toolsets(set(child_toolsets))
+    )
     child_toolsets = _strip_blocked_tools(child_toolsets)
 
     raw_parent_disabled = getattr(parent_agent, "disabled_toolsets", None)
     inherited_disabled = (
         [str(name) for name in raw_parent_disabled] if isinstance(raw_parent_disabled, (list, tuple, set)) else []
     )
-    if effective_role == "orchestrator":
-        inherited_disabled = [name for name in inherited_disabled if name != "delegation"]
+    if can_delegate:
+        if cap is None:
+            inherited_disabled = [name for name in inherited_disabled if name != "delegation"]
         if "delegation" not in child_toolsets:
             child_toolsets.append("delegation")
     child_disabled_toolsets = list(
-        dict.fromkeys(inherited_disabled + _blocked_toolsets_for_role(effective_role) + ["kanban"])
+        dict.fromkeys(inherited_disabled + _blocked_toolsets_for_role(
+            "orchestrator" if can_delegate else "leaf"
+        ) + ["kanban"])
     )
     return child_toolsets, child_disabled_toolsets
