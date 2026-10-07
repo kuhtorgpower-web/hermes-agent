@@ -202,7 +202,7 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
     try:
         from tools.bot_mode_probe import (
             BOT_CHAT_TITLE, _display_name, _handle, _hermes_root, _peers, _profile_name as _self_profile_name,
-            _roster, is_bot_mode_managed,
+            _parked_profile, _roster, is_bot_mode_managed,
         )
         from tools.bot_relay import BOT_CHAT_TURN_ARGS, _hermes_cli
 
@@ -271,6 +271,13 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
             return relayed
     # Local teammate — folder id, or a friendly name / Desktop @-slug ('Scribe', 'Dr. Foo').
     resolved = _resolve_local_name(raw_target, roster, root)
+    # Exact active folder ids resolve before aliases. Only an unqualified target that
+    # remains unresolved can name a parked local profile; a connection-qualified name
+    # has already had its explicit remote resolver opportunity above.
+    if resolved is None and "@" not in raw_target.strip().lstrip("@"):
+        parked = _parked_profile(root, raw_target)
+        if parked is not None:
+            return _err(f"Profile '{parked[0]}' is parked and cannot receive messages. Unpark it before retrying.")
     is_local_shape = bool(_LOCAL_TARGET_RE.match(raw_target))
     if resolved is None and not is_local_shape and "@" not in raw_target:
         return _roster_err(f"Invalid target: {raw_target!r}.")
@@ -415,13 +422,20 @@ def _delivery_lock(argv: list[str], *, stdin_file: bool):
     return acquire_turn_lock(_hermes_root(Path(_default_home())), argv[2])
 
 
-def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]] = None) -> int:
+def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]] = None,
+                    profile_home: Path | None = None) -> int:
     """One Bot Chat turn via ``--query-file`` (plus one policy-gated retry); re-emits
     the transport's streams and returns its exit code. Transient failures re-run the
     same session; a context_overflow re-run lets the retried turn's pre-API compaction
     compact the transcript first (no fresh session is ever minted). Auth/quota/config never retry."""
 
     def _turn(turn_env=env):
+        # The profile can be parked while an earlier attempt runs. Recheck immediately
+        # before every subprocess start so a policy-gated retry cannot outlive a park.
+        if _delivery_target_is_parked(argv, profile_home):
+            print(json.dumps({"error": f"Profile '{argv[2]}' is parked and cannot receive messages. "
+                                      "Unpark it before retrying.", "reason": "agent_blocked"}))
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
         return subprocess.run([*argv, "--query-file", dm_file], check=False, stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, encoding="utf-8", errors="replace", env=turn_env)
 
@@ -555,7 +569,30 @@ def _local_delivery_home(argv: list[str]) -> Path | None:
         return None
     from tools.bot_mode_probe import _hermes_root, _roster
 
-    return dict(_roster(_hermes_root(Path(_default_home())))).get(argv[2])
+    root = _hermes_root(Path(_default_home()))
+    # Preserve the named home even when it has just been parked and is consequently
+    # absent from the active roster; the delivery runner must be able to recheck it.
+    target = argv[2]
+    if target == "default":
+        return root
+    candidate = root / "profiles" / target
+    from hermes_constants import PROFILE_ID_RE, named_profile_is_live
+
+    if PROFILE_ID_RE.match(target) and named_profile_is_live(candidate):
+        return candidate
+    return dict(_roster(root)).get(target)
+
+
+def _delivery_target_is_parked(argv: list[str], profile_home: Path | None) -> bool:
+    """Recheck the local target's parked marker at the final runner boundary."""
+    if len(argv) < 3 or argv[1] != "-p" or argv[2] == "default":
+        return False
+    home = profile_home or _local_delivery_home(argv)
+    if home is None:
+        return False
+    from hermes_cli.profiles import profile_is_parked
+
+    return profile_is_parked(home)
 
 
 def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
@@ -572,6 +609,10 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
     ever minted. Auth/quota/config failures never retry. Peer transports (stdin mode) retry on their own
     gateway's deliver path, not here.
     """
+    if _delivery_target_is_parked(argv, profile_home):
+        print(json.dumps({"error": f"Profile '{argv[2]}' is parked and cannot receive messages. "
+                                  "Unpark it before retrying.", "reason": "agent_blocked"}))
+        return 1
     # The live consumer owns turn admission; never compete for its CLI lease.
     if not stdin_file:
         home = profile_home or _local_delivery_home(argv)
@@ -592,7 +633,17 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
         env = delivery_env(author, profile_home if not stdin_file else None)
         with _delivery_lock(argv, stdin_file=stdin_file):
             if not stdin_file:
-                return _run_local_turn(argv, dm_file, env=env)
+                if _delivery_target_is_parked(argv, profile_home):
+                    retain_payload = True
+                    print(json.dumps({"error": f"Profile '{argv[2]}' is parked and cannot receive messages. "
+                                              "Unpark it before retrying.", "reason": "agent_blocked"}))
+                    return 1
+                result = _run_local_turn(argv, dm_file, env=env, profile_home=profile_home)
+                # A retry can discover the park after the first attempt has already
+                # failed. Keep the payload when the final result is blocked by that race.
+                if result != 0 and _delivery_target_is_parked(argv, profile_home):
+                    retain_payload = True
+                return result
             # Keep the file open until the transport exits; cleanup occurs
             # after subprocess.run returns, not merely after stdin reaches EOF.
             with open(dm_file, "r", encoding="utf-8-sig") as stream:
@@ -605,6 +656,11 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
             raise
         # The only safe retry point is a lock refusal: no child turn ran, so the same
         # payload and delivery id can still be handed to the live owner exactly once.
+        if _delivery_target_is_parked(argv, profile_home):
+            retain_payload = True
+            print(json.dumps({"error": f"Profile '{argv[2]}' is parked and cannot receive messages. "
+                                      "Unpark it before retrying.", "reason": "agent_blocked"}))
+            return 1
         home = profile_home or _local_delivery_home(argv)
         if home is None:
             raise
@@ -659,6 +715,8 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
                     task_id: Optional[str], agent: Any, profile_home: Path | None = None,
                     author: Optional[dict] = None) -> str:
     """Create a DM file and transfer its cleanup ownership to the runner."""
+    if _delivery_target_is_parked(argv, profile_home):
+        return _err(f"Profile '{argv[2]}' is parked and cannot receive messages. Unpark it before retrying.")
     dm_file = _write_dm_file(content)
     if profile_home is not None:
         try:

@@ -197,6 +197,66 @@ def test_unknown_target_lists_roster(tmp_path):
     assert set(result["teammates"]) == {"researcher", "coder"}
 
 
+@pytest.mark.parametrize("target", ["researcher", "Research Lead"])
+def test_parked_local_target_is_omitted_and_refused_before_any_delivery(tmp_path, monkeypatch, target):
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    profile = home / "profiles" / "researcher"
+    profile.joinpath("profile.yaml").write_text(
+        "display_name: Research Lead\nui_meta:\n  hermes-bots:\n    shape: cloud\n", encoding="utf-8"
+    )
+    (profile / "gateway.parked").touch()
+    agent = _FakeAgent(home)
+    roster = bot_mode_probe.get_bot_mode_protocol_section(home)
+    assert "researcher" not in roster
+    monkeypatch.setattr(bot_mode_dm, "_write_dm_file", lambda *_: pytest.fail("must not write DM payload"))
+    monkeypatch.setattr(bot_mode_dm, "_try_relay_delivery", lambda *a, **k: pytest.fail("must not use remote fallback"))
+    monkeypatch.setattr(bot_mode_dm, "_spawn_delivery", lambda *a, **k: pytest.fail("must not spawn delivery"))
+
+    result = json.loads(bot_mode_dm.message_agent_tool(target=target, message="hi", agent=agent))
+    assert "parked" in result["error"]
+    start_result = json.loads(bot_mode_dm._start_delivery(
+        ["hermes", "-p", "researcher"], "hi", "@researcher", stdin_file=False,
+        task_id=None, agent=agent, profile_home=profile,
+    ))
+    assert "parked" in start_result["error"]
+
+
+def test_qualified_remote_target_is_resolved_before_local_parked_alias(tmp_path, monkeypatch):
+    home = _managed_home(tmp_path, teammates=("onboarder",))
+    (home / "profiles" / "onboarder" / "gateway.parked").touch()
+    calls = []
+
+    def resolve_remote(root, target, content, sender, **kwargs):
+        calls.append(target)
+        return json.dumps({"status": "queued", "to": target})
+
+    monkeypatch.setattr(bot_mode_dm, "_try_relay_delivery", resolve_remote)
+    result = json.loads(bot_mode_dm.message_agent_tool(
+        target="onboarder@other-connection", message="hi", agent=_FakeAgent(home)
+    ))
+    assert result == {"status": "queued", "to": "onboarder@other-connection"}
+    assert calls == ["onboarder@other-connection"]
+
+
+def test_active_exact_folder_id_wins_over_parked_friendly_alias(tmp_path, monkeypatch):
+    home = _managed_home(tmp_path, teammates=("onboarder", "coder"))
+    parked = home / "profiles" / "onboarder"
+    parked.joinpath("profile.yaml").write_text(
+        "display_name: coder\nui_meta:\n  hermes-bots:\n    shape: cloud\n", encoding="utf-8"
+    )
+    (parked / "gateway.parked").touch()
+    starts = []
+
+    def start(argv, content, label, **kwargs):
+        starts.append((argv, label))
+        return json.dumps({"status": "started"})
+
+    monkeypatch.setattr(bot_mode_dm, "_start_delivery", start)
+    result = json.loads(bot_mode_dm.message_agent_tool("coder", "hi", agent=_FakeAgent(home)))
+    assert result == {"status": "started"}
+    assert starts[0][0][2] == "coder"
+
+
 def test_cannot_message_self(tmp_path):
     home = _managed_home(tmp_path)
     agent = _FakeAgent(home, title="Bot Chat")  # default profile
@@ -667,6 +727,124 @@ def test_live_dm_runner_retry_never_reexecutes_failed_claim(tmp_path, monkeypatc
     assert failed["status"] == "failed"
     assert failed["delivery_id"] == queued["delivery_id"]
     assert dm_file.read_text(encoding="utf-8") == "hello"
+
+
+def test_delivery_runner_rechecks_parked_target_before_admission_or_cli(tmp_path, monkeypatch, capsys):
+    home = _managed_home(tmp_path)
+    target = home / "profiles" / "researcher"
+    dm_file = tmp_path / "prepared-message.txt"
+    dm_file.write_text("already prepared", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(bot_mode_dm, "_admit_live_dm", lambda *a, **k: pytest.fail("must not admit after park"))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("must not launch CLI after park"))
+
+    # The payload was prepared while the target was active; parking races the runner.
+    (target / "gateway.parked").touch()
+    assert bot_mode_dm._run_delivery(["hermes", "-p", "researcher"], str(dm_file),
+                                     stdin_file=False, profile_home=target) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert "parked" in result["error"]
+    assert dm_file.read_text(encoding="utf-8") == "already prepared"
+
+
+def test_delivery_runner_rechecks_after_lock_wait_before_cli(tmp_path, monkeypatch, capsys):
+    from contextlib import contextmanager
+
+    home = _managed_home(tmp_path)
+    target = home / "profiles" / "researcher"
+    dm_file = tmp_path / "prepared-message.txt"
+    dm_file.write_text("already prepared", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(bot_mode_dm, "_admit_live_dm", lambda *a, **k: None)
+    monkeypatch.setattr(bot_mode_dm, "_run_local_turn", lambda *a, **k: pytest.fail("must not launch after lock"))
+
+    @contextmanager
+    def park_when_lock_acquired(*args, **kwargs):
+        (target / "gateway.parked").touch()
+        yield
+
+    monkeypatch.setattr(bot_mode_dm, "_delivery_lock", park_when_lock_acquired)
+    assert bot_mode_dm._run_delivery(["hermes", "-p", "researcher"], str(dm_file),
+                                     stdin_file=False, profile_home=target) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert "parked" in result["error"]
+    assert dm_file.read_text(encoding="utf-8") == "already prepared"
+
+
+def test_local_turn_rechecks_parked_target_before_retry(tmp_path, monkeypatch, capsys):
+    home = _managed_home(tmp_path)
+    target = home / "profiles" / "researcher"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    attempts = []
+
+    def fail_first_turn(*args, **kwargs):
+        attempts.append(args)
+        (target / "gateway.parked").touch()
+        return subprocess.CompletedProcess(args[0], 1, stdout="", stderr="HTTP 429 rate limit")
+
+    monkeypatch.setattr(subprocess, "run", fail_first_turn)
+    result = bot_mode_dm._run_local_turn(["hermes", "-p", "researcher"], str(tmp_path / "message"),
+                                         profile_home=target)
+    assert result == 1
+    assert len(attempts) == 1
+    assert "parked" in json.loads(capsys.readouterr().out)["error"]
+
+
+def test_delivery_runner_retains_payload_when_parked_during_retry(tmp_path, monkeypatch, capsys):
+    from contextlib import nullcontext
+    from tools import bot_relay
+
+    home = _managed_home(tmp_path)
+    target = home / "profiles" / "researcher"
+    dm_file = tmp_path / "prepared-message.txt"
+    dm_file.write_text("same delivery payload", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(bot_mode_dm, "_admit_live_dm", lambda *a, **k: None)
+    monkeypatch.setattr(bot_relay, "delivery_env", lambda *a, **k: {})
+    monkeypatch.setattr(bot_mode_dm, "_delivery_lock", lambda *a, **k: nullcontext())
+    attempts = []
+
+    def fail_first_turn(*args, **kwargs):
+        attempts.append(args)
+        (target / "gateway.parked").touch()
+        return subprocess.CompletedProcess(args[0], 1, stdout="", stderr="HTTP 429 rate limit")
+
+    monkeypatch.setattr(subprocess, "run", fail_first_turn)
+    assert bot_mode_dm._run_delivery(["hermes", "-p", "researcher"], str(dm_file),
+                                     stdin_file=False, profile_home=target) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert "parked" in result["error"]
+    assert len(attempts) == 1
+    assert dm_file.read_text(encoding="utf-8") == "same delivery payload"
+
+
+def test_delivery_runner_busy_wait_park_blocks_live_admission_and_retains_payload(tmp_path, monkeypatch, capsys):
+    from tools import bot_relay
+
+    home = _managed_home(tmp_path)
+    target = home / "profiles" / "researcher"
+    dm_file = tmp_path / "prepared-message.txt"
+    dm_file.write_text("same delivery payload", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    admissions = []
+    monkeypatch.setattr(bot_mode_dm, "_admit_live_dm", lambda *a, **k: admissions.append(a) or None)
+    monkeypatch.setattr(bot_relay, "delivery_env", lambda *a, **k: {})
+
+    class ParkThenReportBusy:
+        def __enter__(self):
+            (target / "gateway.parked").touch()
+            raise bot_relay.TurnBusyError("researcher", 1.0)
+
+        def __exit__(self, *_):
+            return False
+
+    monkeypatch.setattr(bot_mode_dm, "_delivery_lock", lambda *a, **k: ParkThenReportBusy())
+    assert bot_mode_dm._run_delivery(["hermes", "-p", "researcher"], str(dm_file),
+                                     stdin_file=False, profile_home=target) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert "parked" in result["error"]
+    assert len(admissions) == 1  # initial preflight only; no admission after the busy wait
+    assert dm_file.read_text(encoding="utf-8") == "same delivery payload"
 
 
 @pytest.mark.parametrize("status", ["settled", "failed"])
