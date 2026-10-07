@@ -75,6 +75,7 @@ def _roster(root: Path) -> list[tuple[str, Path]]:
     teammates (#99392), and neither is a marker-carrying dir whose name is not a profile id —
     a parked backup or staging dir must never become a ``message_agent`` target (#116905)."""
     from hermes_constants import PROFILE_ID_RE, named_profile_is_live
+    from hermes_cli.profiles import profile_is_parked
 
     profiles = root / "profiles"
     named = _swallow(
@@ -82,12 +83,43 @@ def _roster(root: Path) -> list[tuple[str, Path]]:
             (c.name, c)
             for c in sorted(profiles.iterdir())
             if c.name != "default" and PROFILE_ID_RE.match(c.name) and named_profile_is_live(c)
+            and not profile_is_parked(c)
         ]
         if profiles.is_dir()
         else [],
         [],
     )
     return [("default", root), *named]
+
+
+def _parked_profile(root: Path, target: str) -> tuple[str, Path] | None:
+    """Resolve an explicitly named parked profile, including its friendly aliases.
+
+    Parked profiles are intentionally absent from the teammate roster, but a direct
+    request for one must be refused locally rather than mistaken for a remote target.
+    """
+    from hermes_constants import PROFILE_ID_RE, named_profile_is_live
+    from hermes_cli.profiles import profile_is_parked
+
+    want = str(target or "").strip().lstrip("@").lower()
+    if not want:
+        return None
+    wanted_forms = alias_forms(want) | {want}
+    profiles = root / "profiles"
+    try:
+        candidates = [c for c in sorted(profiles.iterdir())
+                      if c.name != "default" and PROFILE_ID_RE.match(c.name)
+                      and named_profile_is_live(c) and profile_is_parked(c)]
+    except OSError:
+        return None
+    exact = next((c for c in candidates if c.name.lower() == want), None)
+    if exact is not None:
+        return exact.name, exact
+    hits = []
+    for candidate in candidates:
+        if any(wanted_forms & alias_forms(name) for name in _friendly_names(candidate) if name):
+            hits.append(candidate)
+    return (hits[0].name, hits[0]) if len(hits) == 1 else None
 
 
 def _read_yaml_dict(path: Path, needle: str | None = None) -> dict | None:
@@ -119,7 +151,19 @@ def _is_bot_managed(profile_dir: Path) -> bool:
 
 
 def _any_managed(root: Path) -> bool:
-    return any(_is_bot_managed(d) for _n, d in _roster(root))
+    # A parked profile is still an installed Bot Mode participant; its presence keeps
+    # the capability gate open while its destination remains absent from the roster.
+    from hermes_constants import PROFILE_ID_RE, named_profile_is_live
+
+    homes = [d for _n, d in _roster(root)]
+    profiles = root / "profiles"
+    try:
+        homes.extend(c for c in profiles.iterdir() if c.name != "default"
+                     and PROFILE_ID_RE.match(c.name) and named_profile_is_live(c)
+                     and c not in homes)
+    except OSError:
+        pass
+    return any(_is_bot_managed(d) for d in homes)
 
 
 def is_bot_mode_managed(home: str | os.PathLike | None = None) -> bool:
